@@ -65,6 +65,10 @@ new bool:   g_bMaplistFinalized;
 new         g_iMapsPlayed;
 new bool:   g_bMapsetInitialized;
 new         g_iMapCount;
+
+new         g_iInfoChangeLevelEntity = -1;
+
+
 new         g_iTeamCampaignScore[2];
 new bool:   g_bForcingMapset;
 new bool:   g_bCoopEndSaferoomClosed;	// Whether the end saferoom door has been closed
@@ -78,7 +82,7 @@ new Handle: g_hForwardEnd;
 
 new Handle: g_hCountDownTimer;
 
-new bool:g_bNativeStatistics = false;
+new bool:   g_bNativeStatistics = false;
 
 
 // ----------------------------------------------------------
@@ -144,6 +148,8 @@ public OnPluginStart() {
 					"Shows a player cmt's selected map list.");
 	RegConsoleCmd(	"sm_veto",			Veto,
 					"Lets players veto a map. Uses per team per game cvar'd.");
+
+	RegConsoleCmd("sm_mapsetdebug", Debug, "Just debugging stuff.");
 
 	g_hCvarDebug = CreateConVar("cmt_debug", "0",
 		"Debug mode. (0: only error reporting, -1: disable all reports, 1+: set debug report level)",
@@ -219,17 +225,15 @@ public OnMapStart() {
 	g_bCoopEndSaferoomClosed = false;
 	g_bSwitchingForCoop = false;
 
+	FindInfoChangeLevelEntity();
+	PrintInfoChangeLevelEntityInfo(); // debugging
+
 	// let other plugins know what the map *after* this one will be (unless it is the last map)
-	if (! g_bMaplistFinalized || g_iMapsPlayed >= g_iMapCount-1) {
+	if (! g_bMaplistFinalized || g_iMapsPlayed >= g_iMapCount - 1) {
 		return;
 	}
 
-	decl String:buffer[BUF_SZ];
-	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed+1, buffer, BUF_SZ);
-
-	Call_StartForward(g_hForwardNext);
-	Call_PushString(buffer);
-	Call_Finish();
+	ForwardMapsetNextMap();
 }
 
 public OnRoundStart() {
@@ -245,16 +249,24 @@ public Action:Timed_PostOnRoundStart(Handle:timer) {
 
 	PrintDebug(4, "[cmt] PostOnRoundStart");
 
+	IncrementMapsPlayed();
+	PrepareMapProgressionOnRoundStart();
+
 	if (IsCoopMode()) {
 		return;
 	}
 
 	CallSetCampaignScoresSdk();
 	DirectlySetVersusCampaignScores();
+	WarpAllSurvivorsToStartSaferoom();
 }
 
 public OnRoundEnd() {
 	PrintDebug(4, "[cmt] OnRoundEnd");
+
+	decl String: sMapName[BUF_SZ];
+	GetNextMapSetInfoChangeLevelEntity(sMapName);
+	PrintDebug(9, "[cmt] info_changelevel mapname currently set: '%s'", sMapName);
 
 	if (IsCoopMode()) {
 		return;
@@ -269,10 +281,13 @@ public Action:Timed_PostOnRoundEnd(Handle:timer, any:round) {
 
 	RememberRoundScore(round);
 
-	if (round) {
-		CallSetCampaignScoresSdk();
-		PerformMapProgression();
+	// This is for versus, so only do it after we're done with both survivor rounds.
+	if (! round) {
+		return;
 	}
+
+	CallSetCampaignScoresSdk();
+	PerformMapProgressionOnRoundEnd();
 }
 
 // Coop game fix: when the end saferoom door closes, we instantly move to the next map,
@@ -320,8 +335,33 @@ public void OnDoorOpen(Event event, const char[] name, bool dontBroadcast) {
 	}
 
 	g_bCoopEndSaferoomClosed = false;
+}
 
-	return;
+void WarpAllSurvivorsToStartSaferoom() {
+	for (new client = 1; client <= MaxClients; client++) {
+		if (! IsSurvivorClient(client)) {
+			continue;
+		}
+
+		WarpClientToSaferoom(client, false);
+	}
+}
+
+void WarpClientToSaferoom(client, bool:flagsSet = false)
+{
+	new warp_flags;
+	new give_flags;
+
+	if (! flagsSet) {
+		warp_flags = GetCommandFlags("warp_to_start_area");
+		SetCommandFlags("warp_to_start_area", warp_flags & ~FCVAR_CHEAT);
+	}
+
+	FakeClientCommand(client, "warp_to_start_area");
+
+	if (! flagsSet) {
+		SetCommandFlags("warp_to_start_area", warp_flags);
+	}
 }
 
 // If a survivor dies, while the end saferoom door is closed, and all living survivors are in the end saferoom,
@@ -405,6 +445,32 @@ public Action:ForceMapSet(client, args) {
 	g_bMapsetInitialized = true;
 	g_bForcingMapset = true;
 	CreateTimer(0.1, Timed_PostMapSet);
+
+	return Plugin_Handled;
+}
+
+public Action:Debug(client, args) {
+	// Debugging
+	new entCount = GetEntityCount();
+	new String:sEdictClassName[128];
+	decl String:buffer[256];
+
+	for (new i = 0; i != entCount; i++) {
+		if (! IsValidEntity(i)) {
+			continue;
+		}
+
+		GetEdictClassname(i, sEdictClassName, 128);
+		if (StrContains(sEdictClassName, "info_changelevel", false) != -1) {
+			PrintToServer("[cmt][DEBUG] %i %s", i, sEdictClassName);
+
+			GetEntPropString(i, Prop_Data, "m_mapName", buffer, sizeof(buffer));
+			PrintToServer("[cmt][DEBUG] -> 'm_mapName': %s", buffer);
+			buffer = "c8m1_apartment";
+			SetEntPropString(i, Prop_Data, "m_mapName", buffer);
+			break;
+		}
+	}
 
 	return Plugin_Handled;
 }
@@ -679,16 +745,105 @@ public Action:Timed_PostMapSet(Handle:timer) {
 
 
 // ----------------------------------------------------------
+// 		Forwards
+// ----------------------------------------------------------
+
+void ForwardMapsetStart() {
+	decl String:sMapName[BUF_SZ];
+	GetFirstMapName(sMapName);
+
+	Call_StartForward(g_hForwardStart);
+	Call_PushCell(g_iMapCount);
+	Call_PushString(sMapName);
+	Call_Finish();
+}
+
+void ForwardMapsetNextMap() {
+	decl String:sMapName[BUF_SZ];
+	GetNextMapName(sMapName);
+
+	Call_StartForward(g_hForwardNext);
+	Call_PushString(sMapName);
+	Call_Finish();
+}
+
+void ForwardMapsetEnd() {
+	Call_StartForward(g_hForwardEnd);
+	Call_Finish();
+}
+
+
+// ----------------------------------------------------------
 // 		Map switching logic
 // ----------------------------------------------------------
 
-stock PerformMapProgression() {
-	if (++g_iMapsPlayed < g_iMapCount) {
-		if (g_bNativeStatistics && IsCoopMode()) {
-			PLAYSTATS_BroadcastRoundStats();
-		}
+// When the mapset is kicked off with the first map.
+void DoMapChangeForStartOfMapset() {
+	decl String:sMapName[BUF_SZ];
+	GetFirstMapName(sMapName);
 
-		GotoNextMap();
+	PrintDebug(2, "[cmt] Forcing mapchange for mapset start ('%s')", sMapName);
+	ForceChangeLevel(sMapName, "Custom map transitions.");
+}
+
+// At the start of a (normal) map, prepare so we progress to the next map in the set.
+void PrepareMapProgressionOnRoundStart() {
+	if (IsFinaleMap()) {
+		return;
+	}
+
+	decl String:sMapName[BUF_SZ];
+	GetUpcomingMapName(sMapName);
+
+	if (IsCoopMode()) {
+		PerformCoopMapChangeForNormalMap(sMapName);
+		return;
+	}
+
+	PerformVersusMapChangeForNormalMap(sMapName);
+}
+
+void PerformMapProgressionOnRoundEnd() {
+	if (! IsFinaleMap() ) {
+		return;
+	}
+
+	decl String:sMapName[BUF_SZ];
+	GetUpcomingMapName(sMapName);
+
+	if (IsCoopMode()) {
+		PerformCoopMapChangeForFinaleMap(sMapName);
+		return;
+	}
+
+	PerformVersusMapChangeForFinaleMap(sMapName);
+}
+
+
+// Finale maps don't work with the normal progression, so we must force them.
+// This is not recommended for coop games, but should be possible.
+void DoMapChangeForFinale() {
+
+}
+
+void FinishMapSetAfterLastMap() {
+	PrintDebug(4, "[cmt] FinishMapSetAfterLastMap");
+	ForwardMapsetEnd();
+
+	ServerCommand("sm_resetmatch");
+}
+
+void IncrementMapsPlayed() {
+	g_iMapsPlayed++;
+}
+
+void PerformMapProgression() {
+	if (g_iMapsPlayed < g_iMapCount) {
+		//if (g_bNativeStatistics && IsCoopMode()) {
+		//	PLAYSTATS_BroadcastRoundStats();
+		//}
+
+		//GotoNextMap();
 		return;
 	}
 
@@ -696,19 +851,26 @@ stock PerformMapProgression() {
 		PLAYSTATS_BroadcastGameStats();
 	}
 
-	Call_StartForward(g_hForwardEnd);
-	Call_Finish();
-
-	ServerCommand("sm_resetmatch");
+	FinishMapSetAfterLastMap();
 }
+
+
+void GetFirstMapName(char[] sMapName) {
+	GetArrayString(g_hArrayMapOrder, 0, sMapName, BUF_SZ);
+}
+
+void GetUpcomingMapName(char[] sMapName) {
+	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed, sMapName, BUF_SZ);
+}
+
+void GetNextMapName(char[] sMapName) {
+	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed + 1, sMapName, BUF_SZ);
+}
+
 
 void GotoNextMap(bool:force = false) {
 	PrintDebug(4, "[cmt] GotoNextMap");
-
-	decl String:sMapName[BUF_SZ];
-	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed, sMapName, BUF_SZ);
-
-	GotoMap(sMapName, force);
+	//GotoMap(GetUpcomingMapName(), force);
 }
 
 void GotoMap(const char[] sMapName, bool:force = false) {
@@ -720,6 +882,114 @@ void GotoMap(const char[] sMapName, bool:force = false) {
 
 	PrintDebug(2, "[cmt] Using SetNextMap (%s)", sMapName);
 	SetNextMap(sMapName);
+}
+
+
+void PerformVersusMapChangeForNormalMap(const char[] sMapName) {
+	PrintDebug(3, "[cmt] Performing map change (versus, normal) (%s)", sMapName);
+	//SetNextMap(sMapName);
+	SetNextMapInChangeLevelEntity(sMapName);
+}
+
+void PerformVersusMapChangeForFinaleMap(const char[] sMapName) {
+	PrintDebug(3, "[cmt] Performing map change (versus, finale) (%s)", sMapName);
+	// not sure if this even works
+	SetNextMap(sMapName);
+}
+
+void PerformCoopMapChangeForNormalMap(const char[] sMapName) {
+	PrintDebug(3, "[cmt] Performing map change (coop, normal) (%s)", sMapName);
+	//ForceChangeLevel(sMapName, "Custom map transitions.");
+	SetNextMapInChangeLevelEntity(sMapName);
+}
+
+void PerformCoopMapChangeForFinaleMap(const char[] sMapName) {
+	PrintDebug(3, "[cmt] Performing map change (coop, finale) (%s)", sMapName);
+	ForceChangeLevel(sMapName, "Custom map transitions.");
+}
+
+void FindInfoChangeLevelEntity() {
+	new entCount = GetEntityCount();
+	new String:sEdictClassName[BUF_SZ];
+	new String:sTest[BUF_SZ];
+
+	g_iInfoChangeLevelEntity = -1;
+
+	for (new i = 0; i != entCount; i++) {
+		if (! IsValidEntity(i)) {
+			continue;
+		}
+
+		GetEdictClassname(i, sEdictClassName, BUF_SZ);
+		if (StrContains(sEdictClassName, "info_changelevel", false) == -1) {
+			continue;
+		}
+
+		g_iInfoChangeLevelEntity = i;
+		PrintDebug(9, "[cmt] info_changelevel found (entity %d).", i);
+		GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_landmarkName", sTest, sizeof(sTest));
+		PrintDebug(9, "[cmt] (landmark %s).", sTest);
+		return;
+	}
+}
+
+void GetNextMapSetInfoChangeLevelEntity(char[] sMapName) {
+	if (g_iInfoChangeLevelEntity == -1) {
+		return;
+	}
+
+	GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sMapName, BUF_SZ);
+}
+
+void SetNextMapInChangeLevelEntity(const char[] sMapName) {
+	if (g_iInfoChangeLevelEntity == -1) {
+		PrintDebug(9, "[cmt] No info_changelevel found, not setting nextmap that way.");
+		return;
+	}
+
+	new String:sCurrentMapName[BUF_SZ];
+
+	GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sCurrentMapName, sizeof(sCurrentMapName));
+	SetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sMapName);
+
+	PrintDebug(5, "[cmt] Set info_changelevel nextmap value to '%s' (was '%s').", sMapName, sCurrentMapName);
+}
+
+void PrintInfoChangeLevelEntityInfo() {
+	new entCount = GetEntityCount();
+	new String:sEdictClassName[BUF_SZ];
+	new String:sCurrentNextMap[BUF_SZ];
+	new String:sLandmarkName[BUF_SZ];
+
+	for (new i = 0; i != entCount; i++) {
+		if (! IsValidEntity(i)) {
+			continue;
+		}
+
+		GetEdictClassname(i, sEdictClassName, BUF_SZ);
+
+		if (StrContains(sEdictClassName, "info_changelevel", false) != -1) {
+			GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sCurrentNextMap, sizeof(sCurrentNextMap));
+			GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_landmarkName", sLandmarkName, sizeof(sLandmarkName));
+
+			PrintToChatAll("[CMT] info_changelevel is entity %d: nextmap: '%s', landmark: '%s'", i, sCurrentNextMap, sLandmarkName);
+			continue;
+		}
+
+		if (StrContains(sEdictClassName, "info_landmark", false) != -1) {
+			PrintToChatAll("[CMT] info_landmark is entity %d", i);
+			continue;
+		}
+
+		if (StrContains(sEdictClassName, "info_survivor_position", false) != -1) {
+			PrintToChatAll("[CMT] info_survivor_position is entity %d", i);
+			continue;
+		}
+
+		if (StrContains(sEdictClassName, "info_", false) != -1) {
+			PrintToChatAll("[CMT] other entity %s", sEdictClassName);
+		}
+	}
 }
 
 
@@ -828,19 +1098,14 @@ stock VetoingIsOver() {
 public Action:Timed_GiveThemTimeToReadTheMapList(Handle:timer) {
 	g_hCountDownTimer = null;
 
-	// Scores wouldn't cross over because of forced map change before 2nd round end, but doesnt hurt
+	StartMapset();
+}
+
+void StartMapset() {
+	// Scores wouldn't cross over because of forced map change before 2nd round end, but as a safguard:
 	ResetScores();
-
-	// call starting forward
-	decl String:buffer[BUF_SZ];
-	GetArrayString(g_hArrayMapOrder, 0, buffer, BUF_SZ);
-
-	Call_StartForward(g_hForwardStart);
-	Call_PushCell(g_iMapCount);
-	Call_PushString(buffer);
-	Call_Finish();
-
-	GotoNextMap(true);
+	ForwardMapsetStart();
+	DoMapChangeForStartOfMapset();
 }
 
 // Specifiy a rank for a given tag
@@ -935,7 +1200,7 @@ stock GetPrettyName(String:map[]) {
 // 		Basic helpers
 // ----------------------------------------------------------
 
-bool:IsCoopMode() {
+bool: IsCoopMode() {
 	decl String:sGameMode[32];
 	GetConVarString(FindConVar("mp_gamemode"), sGameMode, sizeof(sGameMode));
 
@@ -948,13 +1213,17 @@ bool:IsCoopMode() {
 		||	StrEqual(sGameMode, "mutation20", false);  		// healing gnome
 }
 
-bool:IsSurvivorClient(client)
-{
+bool: IsSurvivorClient(client) {
     return IsClientAndInGame(client) && GetClientTeam(client) == TEAM_SURVIVOR;
 }
 
-stock bool:IsClientAndInGame(index) {
+bool: IsClientAndInGame(index) {
 	return index > 0 && index <= MaxClients && IsClientInGame(index);
+}
+
+bool: IsFinaleMap() {
+    return FindEntityByClassname(-1, "info_changelevel") == -1
+		&& FindEntityByClassname(-1, "trigger_changelevel") == -1;
 }
 
 public PrintDebug(debugLevel, const String:Message[], any:...)
