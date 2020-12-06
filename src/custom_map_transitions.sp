@@ -226,6 +226,9 @@ public OnMapStart() {
 	g_bSwitchingForCoop = false;
 
 	FindInfoChangeLevelEntity();
+
+	//SDKHook(g_iInfoChangeLevelEntity, SDKHook_Use, OnInfoOnChangeLevel);
+	//"OnChangeLevel"
 	PrintInfoChangeLevelEntityInfo(); // debugging
 
 	// let other plugins know what the map *after* this one will be (unless it is the last map)
@@ -235,6 +238,12 @@ public OnMapStart() {
 
 	ForwardMapsetNextMap();
 }
+
+//public Action:OnInfoOnChangeLevel(entity, other) {
+//    PrintDebug(5, "[cmt] OnInfoOnChangeLevel");
+//    return Plugin_Handled;
+//    //return Plugin_Continue;
+//}
 
 public OnRoundStart() {
 	PrintDebug(4, "[cmt] OnRoundStart");
@@ -986,9 +995,9 @@ void PrintInfoChangeLevelEntityInfo() {
 			continue;
 		}
 
-		if (StrContains(sEdictClassName, "info_", false) != -1) {
+		//if (StrContains(sEdictClassName, "info_", false) != -1) {
 			PrintToChatAll("[CMT] other entity %s", sEdictClassName);
-		}
+		//}
 	}
 }
 
@@ -1013,16 +1022,18 @@ void RememberRoundScore(any:round) {
 	DirectlySetVersusCampaignRoundScore(round);
 }
 
-stock CallSetCampaignScoresSdk() {
+void CallSetCampaignScoresSdk() {
 	SDKCall(g_hSDKCallSetCampaignScores, g_iTeamCampaignScore[0], g_iTeamCampaignScore[1]);
 }
 
-stock DirectlySetVersusCampaignScores() {
+
+
+void DirectlySetVersusCampaignScores() {
 	DirectlySetVersusCampaignRoundScore(0);
 	DirectlySetVersusCampaignRoundScore(1);
 }
 
-DirectlySetVersusCampaignRoundScore(any:round) {
+void DirectlySetVersusCampaignRoundScore(any:round) {
 	L4D2Direct_SetVSCampaignScore(round, g_iTeamCampaignScore[round]);
 }
 
