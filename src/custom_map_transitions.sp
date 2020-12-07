@@ -567,11 +567,10 @@ public Action:Maplist(client, args) {
 	new String:output[BUF_SZ] = "Maplist: ";
 	decl String:buffer[BUF_SZ];
 
-	if (g_bMaplistFinalized) {
+	if (g_bMaplistFinalized && ! IsCoopMode()) {
 		Format(output, BUF_SZ, "%s\t %-4d-%4d", output, g_iTeamCampaignScore[0], g_iTeamCampaignScore[1]);
+		PrintToChat(client, output);
 	}
-
-	PrintToChat(client, output);
 
 	// Final Maplist
 	if (g_bMaplistFinalized) {
