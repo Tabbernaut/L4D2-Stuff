@@ -934,7 +934,7 @@ stock GetPrettyName(String:map[]) {
 // 		Basic helpers
 // ----------------------------------------------------------
 
-bool:IsCoopMode() {
+bool: IsCoopMode() {
 	decl String:sGameMode[32];
 	GetConVarString(FindConVar("mp_gamemode"), sGameMode, sizeof(sGameMode));
 
@@ -947,17 +947,12 @@ bool:IsCoopMode() {
 		||	StrEqual(sGameMode, "mutation20", false);  		// healing gnome
 }
 
-bool:IsSurvivorClient(client)
-{
-    return IsClientAndInGame(client) && GetClientTeam(client) == TEAM_SURVIVOR;
+stock bool: IsFinaleMap() {
+    return FindEntityByClassname(-1, "info_changelevel") == -1
+        && FindEntityByClassname(-1, "trigger_changelevel") == -1;
 }
 
-stock bool:IsClientAndInGame(index) {
-	return index > 0 && index <= MaxClients && IsClientInGame(index);
-}
-
-public PrintDebug(debugLevel, const String:Message[], any:...)
-{
+public PrintDebug(debugLevel, const String:Message[], any:...) {
     if (debugLevel > GetConVarInt(g_hCvarDebug)) {
     	return;
     }
