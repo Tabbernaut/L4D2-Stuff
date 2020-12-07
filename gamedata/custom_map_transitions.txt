@@ -1,0 +1,28 @@
+"Games"
+{
+    "left4dead2"
+    {
+        "Signatures"
+        {
+            /*
+             * GetTransitionedLandmarkName(void
+             * Returns the landmark name that is actually looked up during the transition.
+             * If not found, this results in the "Failed to find checkpoint" error.
+             */
+            "GetTransitionedLandmarkName"
+            {
+                "library"   "server"
+                "linux"     "@_Z27GetTransitionedLandmarkNamev"
+            }
+
+            /*
+             * ClearTransitionedLandmarkName(void)
+             */
+            "ClearTransitionedLandmarkName"
+            {
+                "library"   "server"
+                "linux"     "@_Z29ClearTransitionedLandmarkNamev"
+            }
+        }
+    }
+}
