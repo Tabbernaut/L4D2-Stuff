@@ -47,13 +47,17 @@ public Plugin:myinfo =
 #define BUF_SZ   	64
 #define DOOR_DELAY  0.1
 
+#define SURVIVOR_NICK_BILL      0
+#define SURVIVOR_ROCHELLE_ZOEY  1
+#define SURVIVOR_COACH_LOUIS    2
+#define SURVIVOR_ELLIS_FRANCIS  3
+
 const TEAM_SURVIVOR = 2;
 
 new Handle: g_hCvarDebug;
 new Handle: g_hCvarPoolsize;
 new Handle: g_hCvarMinPoolsize;
 new Handle: g_hCvarVetoCount;
-new Handle: g_hCvarCoopSwitchDelay;
 
 new Handle: g_hArrayTags;				// Stores tags for indexing g_hTriePools
 new Handle: g_hTriePools;				// Stores pool array handles by tag name
@@ -67,19 +71,34 @@ new bool:   g_bMapsetInitialized;
 new         g_iMapCount;
 new         g_iTeamCampaignScore[2];
 new bool:   g_bForcingMapset;
-new bool:   g_bCoopEndSaferoomClosed;	// Whether the end saferoom door has been closed
-new bool:   g_bSwitchingForCoop;		// Whether we're already doing a delayed map switch for coop
 
 new Handle: g_hArrayTeamMapScore[2];
+
 new Handle: g_hSDKCallSetCampaignScores;
+new Handle: g_hSDKClearTransitionedLandmarkName;
+
 new Handle: g_hForwardStart;
 new Handle: g_hForwardNext;
 new Handle: g_hForwardEnd;
 
 new Handle: g_hCountDownTimer;
 
-new bool:g_bNativeStatistics = false;
+new bool: g_bNativeStatistics = false;
 
+new g_iInfoChangeLevelEntity = -1;			// The info_changelevel entity for the next map, if any
+new bool: g_bHasMissionBeenLost = false;	// Whether the survivors failed to survivor at least once in coop
+new bool: g_bIsL4d1SurvivorsMap = false;	// Whether it's a map where the survivors should be from L4D1
+
+new const String: g_csSurvivorModels[][] = {
+    "models/survivors/survivor_biker.mdl",
+    "models/survivors/survivor_coach.mdl",
+    "models/survivors/survivor_gambler.mdl",
+    "models/survivors/survivor_manager.mdl",
+    "models/survivors/survivor_mechanic.mdl",
+    "models/survivors/survivor_namvet.mdl",
+    "models/survivors/survivor_producer.mdl",
+    "models/survivors/survivor_teenangst.mdl",
+};
 
 // ----------------------------------------------------------
 // 		Library tracking
@@ -157,17 +176,15 @@ public OnPluginStart() {
 	g_hCvarVetoCount = CreateConVar("cmt_veto_count", "0",
 		"How many vetoes each team gets.",
 		FCVAR_NONE, true, 0.0, false);
-	g_hCvarCoopSwitchDelay = CreateConVar("cmt_coop_switch_delay", "0.25",
-		"How long in seconds to wait before switching (don't set this too high, or the normal mapswitch happens).",
-		FCVAR_NONE, true, 0.0, false);
 
-	HookEvent("door_close", OnDoorClose, EventHookMode_Post);
-	HookEvent("door_open", OnDoorOpen, EventHookMode_Post);
-	HookEvent("player_death", Event_PlayerDeath, EventHookMode_Post);
+	HookEvent("player_transitioned", Event_PlayerTransitioned);
+	HookEvent("round_start_post_nav", Event_RoundStartPostNav);
+	HookEvent("mission_lost", Event_MissionLost);
 
 	PluginStartInit();
 
 	PrepareScoreSignature();
+	PrepareClearTransitionedLandmarkSignature();
 }
 
 PluginStartInit() {
@@ -183,10 +200,10 @@ PluginStartInit() {
 	g_bMapsetInitialized = false;
 	g_bMaplistFinalized = false;
 	g_bForcingMapset = false;
-	g_bCoopEndSaferoomClosed = false;
-	g_bSwitchingForCoop = false;
 
 	g_hCountDownTimer = null;
+
+	g_bHasMissionBeenLost = false;
 }
 
 void PrepareScoreSignature() {
@@ -201,6 +218,14 @@ void PrepareScoreSignature() {
 	g_hSDKCallSetCampaignScores = EndPrepSDKCall();
 }
 
+void PrepareClearTransitionedLandmarkSignature() {
+	if (! PrepSDKCall_SetFromConf(LoadGameConfigFile("custom_map_transitions"), SDKConf_Signature, "ClearTransitionedLandmarkName")) {
+		LogError("Could not find 'ClearTransitionedLandmarkName' signature in gamedata (tabtesting.txt).");
+		return;
+    }
+	PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
+	g_hSDKClearTransitionedLandmarkName = EndPrepSDKCall();
+}
 
 // ----------------------------------------------------------
 // 		Hooks
@@ -216,8 +241,7 @@ public OnMapStart() {
 
 	ServerCommand("sm_nextmap ''");
 
-	g_bCoopEndSaferoomClosed = false;
-	g_bSwitchingForCoop = false;
+	g_bHasMissionBeenLost = false;
 
 	// let other plugins know what the map *after* this one will be (unless it is the last map)
 	if (! g_bMaplistFinalized || g_iMapsPlayed >= g_iMapCount-1) {
@@ -230,6 +254,13 @@ public OnMapStart() {
 	Call_StartForward(g_hForwardNext);
 	Call_PushString(buffer);
 	Call_Finish();
+
+	IncrementMapsPlayed();
+
+	if (IsCoopMode()) {
+		PrecacheModels();
+		FindInfoChangeLevelEntity();
+	}
 }
 
 public OnRoundStart() {
@@ -246,6 +277,10 @@ public Action:Timed_PostOnRoundStart(Handle:timer) {
 	PrintDebug(4, "[cmt] PostOnRoundStart");
 
 	if (IsCoopMode()) {
+		decl String: sNextMapName[BUF_SZ];
+		GetNextMapInMapset(sNextMapName, BUF_SZ);
+		SetNextMapInChangeLevelEntity(sNextMapName);
+
 		return;
 	}
 
@@ -269,115 +304,39 @@ public Action:Timed_PostOnRoundEnd(Handle:timer, any:round) {
 
 	RememberRoundScore(round);
 
-	if (round) {
-		CallSetCampaignScoresSdk();
-		PerformMapProgression();
-	}
-}
-
-// Coop game fix: when the end saferoom door closes, we instantly move to the next map,
-// avoiding issues that happen in coop when changing maps at the normal time on actual round end.
-public void OnDoorClose(Event event, const char[] name, bool dontBroadcast) {
-	if (! event.GetBool("checkpoint") || g_bSwitchingForCoop) {
+	if (! round) {
 		return;
 	}
 
-	PrintDebug(6, "[cmt] OnDoorClose for checkpoint door");
-
-	if (! IsCoopMode()) {
-		PrintDebug(6, "[cmt] not coop");
-		return;
-	}
-
-	g_bCoopEndSaferoomClosed = true;
-
-	new Float:delay = GetConVarFloat(g_hCvarCoopSwitchDelay);
-
-	PrintDebug(6, "[cmt] read switch delay value");
-
-	if (delay < 0.1) {
-		PerformCoopMapProgressionIfConditionsApply();
-		return;
-	}
-
-	CreateTimer(delay, Timed_PostOnDoorCloseMapSwitch);
-}
-
-public Action:Timed_PostOnDoorCloseMapSwitch(Handle:timer) {
-	PerformCoopMapProgressionIfConditionsApply();
-}
-
-// When the end saferoom door opens (again), we shouldn't end the map.
-public void OnDoorOpen(Event event, const char[] name, bool dontBroadcast) {
-	if (! event.GetBool("checkpoint") || g_bSwitchingForCoop) {
-		return;
-	}
-
-	PrintDebug(6, "[cmt] OnDoorOpen for checkpoint door");
-
-	if (! IsCoopMode()) {
-		return;
-	}
-
-	g_bCoopEndSaferoomClosed = false;
-
-	return;
-}
-
-// If a survivor dies, while the end saferoom door is closed, and all living survivors are in the end saferoom,
-// that's when we should do a mapswitch.
-public Action:Event_PlayerDeath(Handle:hEvent, const String:name[], bool:dontBroadcast) {
-	if (! g_bCoopEndSaferoomClosed || ! IsCoopMode()) {
-		return Plugin_Continue;
-	}
-
-	new victim = GetClientOfUserId(GetEventInt(hEvent, "userid"));
-
-	if (! IsSurvivorClient(victim)) {
-		return Plugin_Continue;
-	}
-
-	PerformCoopMapProgressionIfConditionsApply();
-
-	return Plugin_Continue;
-}
-
-void PerformCoopMapProgressionIfConditionsApply() {
-	PrintDebug(5, "[cmt] PerformCoopMapProgressionIfConditionsApply");
-
-	if (! AreAllLivingSurvivorsInEndSafeRoom()) {
-		return;
-	}
-
-	PrintDebug(3, "[cmt] Performing map progression (coop)");
-
-	g_bSwitchingForCoop = true;
+	CallSetCampaignScoresSdk();
 	PerformMapProgression();
 }
 
-bool: AreAllLivingSurvivorsInEndSafeRoom() {
-	for (new client = 1; client <= MaxClients; client++) {
-		if (! IsSurvivorClient(client)) {
-			continue;
-		}
-
-		if (! IsPlayerAlive(client)) {
-			PrintDebug(9, "[cmt] Client %d is dead.", client);
-			continue;
-		}
-
-		if (SAFEDETECT_IsPlayerInEndSaferoom(client)) {
-			PrintDebug(9, "[cmt] Client %d is in end saferoom.", client);
-			continue;
-		}
-
-
-		return false;
+public void Event_PlayerTransitioned(Event event, const char[] name, bool dontBroadcast) {
+	if (! IsCoopMode()) {
+		return;
 	}
 
-	PrintDebug(9, "[cmt] All living survivors are in the end saferoom");
+	new client = GetClientOfUserId(GetEventInt(event, "userid"));
 
-	return true;
+	PrintDebug(9, "[cmt] Transitioned client %d, warping to saferoom", client);
+	ReturnPlayerToSaferoom(client);
+	CheckClientModel(client);
+}
+
+public Event_RoundStartPostNav(Handle:hEvent, const String:name[], bool:dontBroadcast) {
+	if (! IsCoopMode()) {
+		return;
+	}
+
+	PrintDebug(9, "[cmt] Event: Round Start Post Nav (for coop)");
+
+	PrecacheModels();
+	ClearLandmark();
+}
+
+public Event_MissionLost(Handle:hEvent, const String:name[], bool:dontBroadcast) {
+    g_bHasMissionBeenLost = true;
 }
 
 
@@ -681,13 +640,24 @@ public Action:Timed_PostMapSet(Handle:timer) {
 // 		Map switching logic
 // ----------------------------------------------------------
 
-stock PerformMapProgression() {
-	if (++g_iMapsPlayed < g_iMapCount) {
-		if (g_bNativeStatistics && IsCoopMode()) {
-			PLAYSTATS_BroadcastRoundStats();
-		}
+void ClearLandmark() {
+	SDKCall(g_hSDKClearTransitionedLandmarkName);
+}
 
-		GotoNextMap();
+void IncrementMapsPlayed() {
+	g_iMapsPlayed++;
+
+	decl String: sNextMap[BUF_SZ];
+	GetNextMapInMapset(sNextMap, BUF_SZ);
+
+	PrintDebug(4, "[cmt] Incrementing maps played, next map: '%s'", sNextMap);
+}
+
+void PerformMapProgression() {
+	if (g_iMapsPlayed < g_iMapCount) {
+		if (! IsCoopMode()) {
+			GotoNextMap();
+		}
 		return;
 	}
 
@@ -704,10 +674,14 @@ stock PerformMapProgression() {
 void GotoNextMap(bool:force = false) {
 	PrintDebug(4, "[cmt] GotoNextMap");
 
-	decl String:sMapName[BUF_SZ];
-	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed, sMapName, BUF_SZ);
+	decl String: sMapName[BUF_SZ];
+	GetNextMapInMapset(sMapName, BUF_SZ);
 
 	GotoMap(sMapName, force);
+}
+
+void GetNextMapInMapset(String: sMapName[], iSize) {
+	GetArrayString(g_hArrayMapOrder, g_iMapsPlayed, sMapName, iSize);
 }
 
 void GotoMap(const char[] sMapName, bool:force = false) {
@@ -721,6 +695,28 @@ void GotoMap(const char[] sMapName, bool:force = false) {
 	SetNextMap(sMapName);
 }
 
+void FindInfoChangeLevelEntity() {
+	g_iInfoChangeLevelEntity = FindEntityByClassname(-1, "info_changelevel");
+	if (g_iInfoChangeLevelEntity == -1) {
+		PrintDebug(7, "[cmt] No info_changelevel found.");
+	} else {
+		PrintDebug(7, "[cmt] info_changelevel found (entity %d).", g_iInfoChangeLevelEntity);
+	}
+}
+
+void SetNextMapInChangeLevelEntity(const char[] sMapName) {
+    if (g_iInfoChangeLevelEntity == -1) {
+    	PrintDebug(9, "[cmt] No info_changelevel entity, not setting m_mapName to '%s'", sMapName);
+        return;
+    }
+
+    new String:sCurrentMapName[BUF_SZ];
+
+    GetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sCurrentMapName, sizeof(sCurrentMapName));
+    SetEntPropString(g_iInfoChangeLevelEntity, Prop_Data, "m_mapName", sMapName);
+
+    PrintDebug(5, "[cmt] Set info_changelevel m_mapName value to '%s' (was '%s').", sMapName, sCurrentMapName);
+}
 
 // ----------------------------------------------------------
 // 		Score handling logic
@@ -761,6 +757,110 @@ stock ResetScores() {
 	GameRules_SetProp("m_iSurvivorScore", 0, _, 1);
 }
 
+
+// ----------------------------------------------------------
+// 		Transition handling logic
+// ----------------------------------------------------------
+
+void ReturnPlayerToSaferoom(client) {
+    new flags;
+
+    flags = GetCommandFlags("warp_to_start_area");
+    SetCommandFlags("warp_to_start_area", flags & ~FCVAR_CHEAT);
+
+    FakeClientCommand(client, "warp_to_start_area");
+
+    SetCommandFlags("warp_to_start_area", flags);
+}
+
+// When a mission is lost in coop, the models don't match the actual survivors.
+// The first time the mission is loaded, things are fine. We use this to detect
+// whether we should have l4d1 or l4d2 survivors.
+void CheckClientModel(client) {
+    new iSurvivorOffset = FindSendPropInfo("CTerrorPlayer", "m_survivorCharacter");
+    new iSurvivor = GetEntData(client, iSurvivorOffset, 1);
+
+    decl String: sModel[BUF_SZ];
+    decl String: sName[BUF_SZ];
+
+    GetClientName(client, sName, BUF_SZ);
+    GetClientModel(client, sModel, BUF_SZ);
+
+    // If we've lost at least once, check whether the survivors are as expected.
+    // If not, fix the model.
+    if (g_bHasMissionBeenLost) {
+        if (
+            g_bIsL4d1SurvivorsMap
+            && (
+                strcmp(sModel, "models/survivors/survivor_biker.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_manager.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_namvet.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_teenangst.mdl") != 0
+            )
+        ) {
+            PrintDebug(6, "[cmt] Incorrect model for client %i (survivor %i) ('%s'). Has model '%s'", client, iSurvivor, sName, sModel);
+
+            if (iSurvivor == SURVIVOR_NICK_BILL) {
+                SetEntityModel(client, "models/survivors/survivor_gambler.mdl");
+            } else if (iSurvivor == SURVIVOR_ROCHELLE_ZOEY) {
+                SetEntityModel(client, "models/survivors/survivor_producer.mdl");
+            } else if (iSurvivor == SURVIVOR_COACH_LOUIS) {
+                SetEntityModel(client, "models/survivors/survivor_coach.mdl");
+            } else if (iSurvivor == SURVIVOR_ELLIS_FRANCIS) {
+                SetEntityModel(client, "models/survivors/survivor_mechanic.mdl");
+            } else {
+                PrintDebug(5, "[cmt] Could not detect expected survivor slot, did not change model (client %i).", client);
+            }
+        }
+
+        if (
+            ! g_bIsL4d1SurvivorsMap
+            && (
+                strcmp(sModel, "models/survivors/survivor_coach.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_gambler.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_mechanic.mdl") != 0
+                || strcmp(sModel, "models/survivors/survivor_producer.mdl") != 0
+            )
+        ) {
+            PrintDebug(6, "[cmt] Incorrect model for client %i (survivor %i) ('%s'). Has model '%s'", client, iSurvivor, sName, sModel);
+
+            if (iSurvivor == SURVIVOR_NICK_BILL) {
+                SetEntityModel(client, "models/survivors/survivor_namvet.mdl");
+            } else if (iSurvivor == SURVIVOR_ROCHELLE_ZOEY) {
+                SetEntityModel(client, "models/survivors/survivor_teenangst.mdl");
+            } else if (iSurvivor == SURVIVOR_COACH_LOUIS) {
+                SetEntityModel(client, "models/survivors/survivor_manager.mdl");
+            } else if (iSurvivor == SURVIVOR_ELLIS_FRANCIS) {
+                SetEntityModel(client, "models/survivors/survivor_biker.mdl");
+            } else {
+                PrintDebug(5, "[cmt] Could not detect expected survivor slot, did not change model (client %i).", client);
+            }
+        }
+        return;
+    }
+
+    // If we haven't lost yet, register what type of survivors we should always have.
+    g_bIsL4d1SurvivorsMap = (
+        strcmp(sModel, "models/survivors/survivor_biker.mdl") != 0
+        || strcmp(sModel, "models/survivors/survivor_manager.mdl") != 0
+        || strcmp(sModel, "models/survivors/survivor_namvet.mdl") != 0
+        || strcmp(sModel, "models/survivors/survivor_teenangst.mdl") != 0
+    );
+
+    if (g_bIsL4d1SurvivorsMap) {
+        PrintDebug(8, "[cmt] Map is detected to have L4D ONE survivors.");
+    } else {
+        PrintDebug(8, "[cmt] Map is detected to have L4D TWO survivors.");
+    }
+}
+
+void PrecacheModels() {
+    for (new i = 0; i < sizeof(g_csSurvivorModels); i++) {
+        if (! IsModelPrecached(g_csSurvivorModels[i])) {
+            PrecacheModel(g_csSurvivorModels[i], true);
+        }
+    }
+}
 
 // ----------------------------------------------------------
 // 		Map pool logic
